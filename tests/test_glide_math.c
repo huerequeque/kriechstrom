@@ -28,6 +28,20 @@ int main(void)
     run(192,100000,44100,32);
     run(16,50000,48000,32);
     assert(kr_glide_inc(100000u,101000u,32768u)==100500u);
+    /* A fresh glide must start from the currently sounding fractional pitch. */
+    {
+        kr_glide_state_t g = {0};
+        const int32_t f3 = 65 * 16 * 65536;
+        kr_glide_begin(&g, f3, f3 + 16 * 65536, 1000);
+        for (int i=0; i<250; ++i)
+            kr_glide_tick(&g, f3 + 16 * 65536);
+        int32_t mid = g.pos;
+        assert(mid > f3 && mid < f3 + 16 * 65536);
+        kr_glide_begin(&g, mid, f3 - 16 * 65536, 1000);
+        for (int i=0; i<1000; ++i)
+            kr_glide_tick(&g, f3 - 16 * 65536);
+        assert(g.pos == f3 - 16 * 65536 && !g.remaining);
+    }
     puts("PASS");
     return 0;
 }
