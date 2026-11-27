@@ -43,6 +43,11 @@ jobs:
             curl -fsSL --retry 3 "$SDK_RAW/$f" -o "$AC79_SDK/$f"
           done
 
+      - name: Fractional glide unit tests
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror tests/test_glide_math.c -o /tmp/test_glide_math
+          /tmp/test_glide_math
+
       - name: Build the firmware
         run: python3 tools/build.py
 
