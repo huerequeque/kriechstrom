@@ -61,5 +61,10 @@ jobs:
             build/kriechstrom.fwsc
             build/felucca.bin
 
+      # Fast static CPU check before the extended test suite. Unlike host tests,
+      # this catches regressions of the FM1's pi32v2 render-loop instruction budget.
+      - name: Target processor budget
+        run: python3 tests/target_budget.py build/felucca.dis tests/target_budget.txt
+
       - name: Host tests
         run: sh tests/run_tests.sh
