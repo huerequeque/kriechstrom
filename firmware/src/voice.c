@@ -669,6 +669,30 @@ static __attribute__((noinline)) void spread_sum(int32_t *out)
 }
 #endif
 
+/* Keep the fractional glide arithmetic out of the CPU-critical mix_part
+ * loop. Full pitch steps remain in voice_t; fractional position is transient.
+ * This helper is deliberately not inlined, like mod_voice. */
+static __attribute__((noinline)) int32_t glide_voice_block(kr_glide_state_t *g, int32_t target)
+{
+    kr_glide_tick(g, target);
+    return g->pos >> 16;
+}
+
+/* All pitch-aware engines receive m.inc (shared voice frequency).
+ * Apply phase interpolation after the modulation matrix (which can change
+ * m.pitch16 and recompute m.inc). The math must not run in the hot loop. */
+static __attribute__((noinline)) void glide_fine_inc(vmod_t *m, const kr_glide_state_t *g)
+{
+    uint32_t frac = (uint32_t)g->pos & 65535u;
+    if (!frac || m->pitch16 >= 2047u)
+        return;
+    {
+        uint32_t lo = pitch_inc(m->pitch16);
+        uint32_t hi = pitch_inc(m->pitch16 + 1);
+        m->inc = kr_glide_inc(m->inc, m->inc + (hi - lo), frac);
+    }
+}
+
 /* render one block of a part into out (cleared here); returns the voices rendered */
 /* Channel bend is live performance state, outside projects/presets. Q8 semitones. */
 static int32_t midi_bend_q8[NTRK], midi_bend_target[NTRK];
@@ -744,8 +768,7 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
             v->env_out = m.amp1;
         }
         kr_glide_state_t *g = &kr_glide[(uint32_t)(t - trk)][i];
-        kr_glide_tick(g, v->pitch16 << 16);
-        v->pitch_cur = g->pos >> 16;
+        v->pitch_cur = glide_voice_block(g, v->pitch16 << 16);
         if (!env && !m.amp0 && v->stage == 2 && !e->sampled)
             continue;                                   /* held at a silent sustain (SUS 0): nothing to render */
         pitch = v->pitch_cur + tune + bend16 + ((lfo * p[P_LD_PIT] * 3) >> 15) + ((m.envq15 * p[P_ED_PIT] * 3) >> 15);
@@ -760,11 +783,8 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
         m.shape = (64 << 8) + ((lfo * p[P_LD_SHP]) >> 7) + ((m.envq15 * p[P_ED_SHP]) >> 7);
         if (MOD(t).on)                                  /* the modulation matrix (mod.c) */
             mod_voice(t, v, &m, v->fine + tune_fine + bend_fine);
-        /* Apply sub-1/16-semitone motion after matrix pitch modulation. */
-        if ((g->pos & 65535) && m.pitch16 < 2047 && pitch >= 0 && pitch < 2047)
-            m.inc = kr_glide_inc(m.inc,
-                                 m.inc + (pitch_inc(m.pitch16 + 1) - pitch_inc(m.pitch16)),
-                                 (uint32_t)g->pos & 65535u);
+        /* Fractional phase increment, off the hot per-voice render loop. */
+        glide_fine_inc(&m, g);
         e->render(t, v, T_SPREAD(t) > v->side ? SPREAD_BUF(t) : out, n, &m);   /* (SPREAD: the left ones) */
         nr++;
     }
