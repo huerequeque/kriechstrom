@@ -11,6 +11,9 @@
  * over one block (stage 4: the envelope goes to 0, the block's amplitude ramp
  * declicks it); one of the part's own is restarted in place, as before. Extra UNISON
  * voices only start when there is room. */
+#include "glide_math.h"
+/* Transient, per-track voice state; saved project layout is unchanged. */
+static kr_glide_state_t kr_glide[NPART][NVOICE];
 static uint32_t vage;                                   /* voice ages: one clock for every part */
 static int32_t lfo_wave(track_t *t, uint32_t ph)
 {
@@ -271,21 +274,31 @@ static voice_t *voice_alloc(track_t *t, uint32_t note)
     return voice_reuse(t, &t->v[best == np ? 0 : best]);
 }
 
-/* glide: RATE = a fixed speed, TIME = the same time for any interval */
+/* Fractional portamento: TIME follows the UI's real duration; RATE is
+ * constant pitch speed measured in semitones/second. */
 static void glide_set(track_t *t, voice_t *v, int glide)
 {
+    kr_glide_state_t *g = &kr_glide[(uint32_t)(t - trk)][(uint32_t)(v - t->v)];
+    int32_t target = v->pitch16 << 16;
+    int32_t start = g->pos;
+    uint32_t ticks, ms10;
     if (!glide || !v->pitch_cur) {
+        kr_glide_begin(g, target, target, 0);
         v->pitch_cur = v->pitch16;
         v->gstep = 0;
         return;
     }
-    if (t->p[P_GLMODE]) {
-        int32_t d = v->pitch16 - v->pitch_cur, ticks = 1 + t->p[P_GLIDE] * t->p[P_GLIDE] / 8;
-        d = d < 0 ? -d : d;
-        v->gstep = d / ticks > 0 ? d / ticks : 1;
-    } else {
-        v->gstep = 0;
+    if ((start >> 16) != v->pitch_cur)
+        start = v->pitch_cur << 16;
+    ms10 = t->p[P_GLIDE] ? TIME_MS_X10[t->p[P_GLIDE] & 127] : 450u;
+    ticks = kr_glide_time_ticks(ms10, FS, CTL);
+    if (!t->p[P_GLMODE]) {
+        uint32_t distance = (uint32_t)(target > start ? target - start : start - target);
+        ticks = (uint32_t)(((uint64_t)ticks * distance + (8u << 16)) / (16u << 16));
+        if (!ticks) ticks = 1u;
     }
+    kr_glide_begin(g, start, target, ticks);
+    v->gstep = 0;
 }
 
 static void voice_start(track_t *t, voice_t *v, uint32_t note, uint32_t vel, int glide)
@@ -656,6 +669,30 @@ static __attribute__((noinline)) void spread_sum(int32_t *out)
 }
 #endif
 
+/* Keep the fractional glide arithmetic out of the CPU-critical mix_part
+ * loop. Full pitch steps remain in voice_t; fractional position is transient.
+ * This helper is deliberately not inlined, like mod_voice. */
+static __attribute__((noinline)) int32_t glide_voice_block(kr_glide_state_t *g, int32_t target)
+{
+    kr_glide_tick(g, target);
+    return g->pos >> 16;
+}
+
+/* All pitch-aware engines receive m.inc (shared voice frequency).
+ * Apply phase interpolation after the modulation matrix (which can change
+ * m.pitch16 and recompute m.inc). The math must not run in the hot loop. */
+static __attribute__((noinline)) void glide_fine_inc(vmod_t *m, const kr_glide_state_t *g)
+{
+    uint32_t frac = (uint32_t)g->pos & 65535u;
+    if (!frac || m->pitch16 >= 2047u)
+        return;
+    {
+        uint32_t lo = pitch_inc(m->pitch16);
+        uint32_t hi = pitch_inc(m->pitch16 + 1);
+        m->inc = kr_glide_inc(m->inc, m->inc + (hi - lo), frac);
+    }
+}
+
 /* render one block of a part into out (cleared here); returns the voices rendered */
 /* Channel bend is live performance state, outside projects/presets. Q8 semitones. */
 static int32_t midi_bend_q8[NTRK], midi_bend_target[NTRK];
@@ -730,13 +767,8 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
             m.amp0 = v->env_out;
             v->env_out = m.amp1;
         }
-        if (v->pitch_cur != v->pitch16) {               /* glide */
-            int32_t d = v->pitch16 - v->pitch_cur;
-            int32_t st = v->gstep ? v->gstep : (int32_t)(ENV_LIN[(p[P_GLIDE] ? p[P_GLIDE] : 40) & 127] >> 14);   /* slide: ~45 ms */
-            if (st < 1)
-                st = 1;
-            v->pitch_cur += d > 0 ? (d < st ? d : st) : (-d < st ? d : -st);
-        }
+        kr_glide_state_t *g = &kr_glide[(uint32_t)(t - trk)][i];
+        v->pitch_cur = glide_voice_block(g, v->pitch16 << 16);
         if (!env && !m.amp0 && v->stage == 2 && !e->sampled)
             continue;                                   /* held at a silent sustain (SUS 0): nothing to render */
         pitch = v->pitch_cur + tune + bend16 + ((lfo * p[P_LD_PIT] * 3) >> 15) + ((m.envq15 * p[P_ED_PIT] * 3) >> 15);
@@ -751,6 +783,8 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
         m.shape = (64 << 8) + ((lfo * p[P_LD_SHP]) >> 7) + ((m.envq15 * p[P_ED_SHP]) >> 7);
         if (MOD(t).on)                                  /* the modulation matrix (mod.c) */
             mod_voice(t, v, &m, v->fine + tune_fine + bend_fine);
+        /* Fractional phase increment, off the hot per-voice render loop. */
+        glide_fine_inc(&m, g);
         e->render(t, v, T_SPREAD(t) > v->side ? SPREAD_BUF(t) : out, n, &m);   /* (SPREAD: the left ones) */
         nr++;
     }

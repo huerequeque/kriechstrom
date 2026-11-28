@@ -43,12 +43,16 @@ jobs:
             curl -fsSL --retry 3 "$SDK_RAW/$f" -o "$AC79_SDK/$f"
           done
 
+      - name: Fractional glide unit tests
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror tests/test_glide_math.c -o /tmp/test_glide_math
+          /tmp/test_glide_math
+
       - name: Build the firmware
         run: python3 tools/build.py
 
-      - name: Host tests
-        run: sh tests/run_tests.sh
-
+      # Make the compiled firmware available promptly for browser-only testing.
+      # The full host test suite still runs below; a build artifact is NOT a release.
       - name: Package
         uses: actions/upload-artifact@v4
         with:
@@ -56,3 +60,11 @@ jobs:
           path: |
             build/kriechstrom.fwsc
             build/felucca.bin
+
+      # Fast static CPU check before the extended test suite. Unlike host tests,
+      # this catches regressions of the FM1's pi32v2 render-loop instruction budget.
+      - name: Target processor budget
+        run: python3 tests/target_budget.py build/felucca.dis tests/target_budget.txt
+
+      - name: Host tests
+        run: sh tests/run_tests.sh
