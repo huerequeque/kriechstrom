@@ -854,6 +854,66 @@ static int chk_keep_mono(char *m, uint32_t n) { return chk_keep(m, n, V_MONO); }
 static int chk_keep_legato(char *m, uint32_t n) { return chk_keep(m, n, V_LEGATO); }
 static int chk_keep_unison(char *m, uint32_t n) { return chk_keep(m, n, V_UNISON); }
 
+/* Exercise the actual sequencer SLIDE path and shared audio renderer, not only
+ * the standalone fixed-point arithmetic. Dispatch held steps directly so the
+ * gate can remain open for the complete 10-second transition. */
+static int chk_slow_seq_glide(char *msg, uint32_t n)
+{
+    track_t *t = &trk[0];
+    voice_t *v = &t->v[0];
+    kr_glide_state_t *g = &kr_glide[0][0];
+    const uint8_t f = 53, fs = 54;                 /* F3, F#3 */
+    const int32_t low = 53 * 16 * 65536, high = 54 * 16 * 65536;
+    const uint32_t ticks = kr_glide_time_ticks(100000u, FS, CTL);
+    uint32_t age, k, dir, bad = 0;
+    host_tracks_init();
+    host_preset(t, 0, 0);                        /* ANALOG */
+    t->p[P_VOICE] = V_LEGATO;
+    t->p[P_GLIDE] = 127;                         /* displayed 10 s */
+    t->p[P_GLMODE] = 1;                          /* TIME */
+    t->p[P_AMODE] = t->p[P_PRIO] = t->p[P_QUANT] = 0;
+    t->p[P_SUS] = 127;
+    t->p[P_SLEN] = 4;
+    put_step(t, 0, 1, &f, ST_NOTE, SF_SLIDE);
+    put_step(t, 1, 1, &fs, ST_NOTE, SF_SLIDE);
+    put_step(t, 2, 1, &f, ST_NOTE, SF_SLIDE);
+    put_step(t, 3, 0, &f, ST_TIE, SF_SLIDE);
+    seq_step(t, &t->step[0], 0, FS, 0);
+    blk();
+    age = v->age;
+    bad += !(v->gate && g->pos == low);
+    for (dir = 0; dir < 2; ++dir) {
+        const int32_t target = dir ? low : high, start = dir ? high : low;
+        int32_t prev = start;
+        seq_step(t, &t->step[dir + 1], dir + 1, FS, 0);
+        bad += !(v->gate && v->age == age && g->pos == start &&
+                 g->remaining == ticks);
+        for (k = 0; k < ticks; ++k) {
+            blk();
+            bad += !v->gate || v->age != age;
+            bad += dir ? (g->pos > prev || g->pos < target)
+                       : (g->pos < prev || g->pos > target);
+            if (k + 1 < ticks) bad += g->pos == target;
+            if (k == 0 && !dir) {
+                vmod_t m = {0};
+                m.pitch16 = v->pitch_cur;
+                m.inc = pitch_inc(m.pitch16);
+                uint32_t before = m.inc;
+                glide_fine_inc(&m, g);
+                bad += m.inc <= before || m.inc >= pitch_inc(m.pitch16 + 1);
+            }
+            if (k + 1 == ticks / 2)
+                bad += abs(g->pos - (low + high) / 2) > 256;
+            prev = g->pos;
+        }
+        bad += g->remaining != 0 || g->pos != target;
+    }
+    seq_release(t);
+    snprintf(msg, n, "F3 <-> F#3: %.3f s each, legato, fractional phase increment, %u failures",
+             (double)ticks * CTL / FS, bad);
+    return !bad;
+}
+
 /* the VOICE engine's cap: 8 keys in POLY and in UNISON (alone: the budget does not limit it) */
 static int chk_voice_cap(char *msg, uint32_t n)
 {
@@ -1093,6 +1153,7 @@ int main(int argc, char **argv)
     add(J_CHECK, "voices: a stolen voice fades")->check = chk_steal_fade;
     add(J_CHECK, "voices: MONO keeps its note")->check = chk_keep_mono;
     add(J_CHECK, "voices: LEGATO keeps its note")->check = chk_keep_legato;
+    add(J_CHECK, "sequencer: 10 s fractional glide in both directions")->check = chk_slow_seq_glide;
     add(J_CHECK, "voices: UNISON keeps its note")->check = chk_keep_unison;
     add(J_CHECK, "voices: VOICE engine cap")->check = chk_voice_cap;
     add(J_CHECK, "routing: no hanging notes")->check = chk_hang;
